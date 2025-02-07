@@ -15,7 +15,12 @@ Installation
 -----
 
 ```
-pip install gpustat-web
+python3 -m venv venv
+source venv/bin/activate
+pip uninstall -y gpustat-web
+pip install --upgrade pip setuptools wheel
+pip install --no-cache-dir --no-build-isolation .
+which gpustat-web
 ```
 
 Python 3.6+ is required.
