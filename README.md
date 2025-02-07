@@ -1,4 +1,4 @@
-gpustat-web
+gpustat-web-netdb
 ===========
 
 A web interface of [`gpustat`][gpustat] ---
@@ -25,11 +25,42 @@ Usage
 
 Launch the application as follows. A SSH connection will be established to each of the specified hosts.
 Make sure `ssh <host>` works under a proper authentication scheme such as SSH authentication.
-
+Now we can set multiple port for different host
 ```
-gpustat-web --port 48109 HOST1 [... HOSTN]
+gpustat-web --port 48109     --exec "10.6.8.82:/home/netdb/.local/bin/gpustat"     --exec "10.6.8.83:/home/netdb/.local/bin/gpustat"     --exec "10.6.8.81:/home/netdb/.local/bin/gpustat"     --exec "140.116.247.117:/mnt/data/home/joeysmith/.local/bin/gpustat" --exec "192.168.61.2:/home/joeysmith/.local/bin/gpustat" --exec "10.6.8.84:/home/netdb/.local/bin/gpustat" --exec "10.6.8.85:/home/netdb/.local/bin/gpustat"    10.6.8.82 10.6.8.83 10.6.8.81 10.6.8.84 10.6.8.85 joeysmith@140.116.247.117:18722 joeysmith@192.168.61.2:6022
 ```
 
+**NOTE**: You should add the ssh-key of the machine that running gpustat-web to other nodes, also every nodes should install gpustat
+```
+ssh-copy-id -i .ssh/id_rsa.pub user@other_node_ip
+```
+Run in background as system service
+-----
+```
+sudo vim /etc/systemd/system/gpustat-web.service
+```
+```
+[Unit]
+Description=GPUStat Web Server
+After=network.target
+
+[Service]
+User=netdb
+WorkingDirectory=/home/netdb
+ExecStart=["YOUR RUNNING COMMAND"]
+Restart=always
+RestartSec=5
+Environment="PATH=/home/netdb/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=multi-user.target
+```
+```
+sudo systemctl daemon-reload
+```
+```
+sudo systemctl restart gpustat-web
+```
 You might get "Host key is not trusted for `<host>`" errors. You'll have to accept and trust SSH keys of the host for the first time (it's stored in `~/.ssh/known_hosts`);
 try `ssh <host>` in the command line, or `ssh -oStrictHostKeyChecking=accept-new <host>` to automatically accept the host key. You can also use an option `gpustat-web --no-verify-host` to bypass SSH Host key validation (although not recommended).
 
