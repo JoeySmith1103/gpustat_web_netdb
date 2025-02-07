@@ -49,118 +49,81 @@ class Context(object):
 
 context = Context()
 
-
 async def run_client(hostname: str, exec_cmd: str, *,
+                     username: str,
                      port=22, verify_host: bool = True,
-                     poll_delay=None, timeout=30.0,
-                     name_length=None, verbose=False):
-    '''An async handler to collect gpustat through a SSH channel.'''
-    L = name_length or 0
-    if poll_delay is None:
-        poll_delay = context.interval
+                     poll_delay=5.0, timeout=30.0,
+                     verbose=False):
+    '''建立 SSH 連線，執行 `gpustat`，並回報狀態'''
 
-    def _str(data: Union[bytes, str]) -> str:
-        if isinstance(data, bytes):
-            data = data.decode("utf-8")
-        return data
+    conn_kwargs = {'known_hosts': None} if not verify_host else {}
 
     async def _loop_body():
-        # establish a SSH connection.
-        # https://asyncssh.readthedocs.io/en/latest/api.html#asyncssh.SSHClientConnectionOptions
-        conn_kwargs = dict()
-        if not verify_host:
-            conn_kwargs['known_hosts'] = None  # Disable SSH host verification
-        async with asyncssh.connect(hostname, port=port, **conn_kwargs) as conn:
-            cprint(f"[{hostname:<{L}}] SSH connection established!", attrs=['bold'])
+        async with asyncssh.connect(hostname, port=port, username=username, **conn_kwargs) as conn:
+            cprint(f"[{hostname}] SSH connection established!", attrs=['bold'])
 
             while True:
-                if False: #verbose: XXX DEBUG
-                    print(f"[{hostname:<{L}}] querying... ")
-
                 result = await asyncio.wait_for(conn.run(exec_cmd), timeout=timeout)
 
-                now = datetime.now().strftime('%Y/%m/%d-%H:%M:%S.%f')
                 if result.exit_status != 0:
-                    cprint(f"[{now} [{hostname:<{L}}] Error, exitcode={result.exit_status}", color='red')
-                    cprint(_str(result.stderr or ''), color='red')
-                    stderr_summary = _str(result.stderr or '').split('\n')[0]
-                    context.host_set_message(hostname, colored(f'[exitcode {result.exit_status}] {stderr_summary}', 'red'))
+                    stderr_summary = result.stderr.split('\n')[0]
+                    context.host_set_message(hostname, colored(f'[Error {result.exit_status}] {stderr_summary}', 'red'))
                 else:
                     if verbose:
-                        cprint(f"[{now} [{hostname:<{L}}] OK from gpustat "
-                               f"({len(_str(result.stdout or ''))} bytes)", color='cyan')
-                    # update data
-                    context.host_status[hostname] = result.stdout
-
-                # wait for a while...
+                        cprint(f"[{hostname}] {result.stdout}", color="cyan")  # ✅ 顯示 debug 訊息
+                    context.host_status[hostname] = result.stdout.strip() + "\n\n\n\n"
+                    
                 await asyncio.sleep(poll_delay)
 
     while True:
         try:
-            # start SSH connection, or reconnect if it was disconnected
             await _loop_body()
-
-        except asyncio.CancelledError:
-            cprint(f"[{hostname:<{L}}] Closed as being cancelled.", attrs=['bold'])
-            break
-        except (asyncio.TimeoutError) as ex:
-            # timeout (retry)
-            cprint(f"Timeout after {timeout} sec: {hostname}", color='red')
-            context.host_set_message(hostname, colored(f"Timeout after {timeout} sec", 'red'))
-        except (asyncssh.misc.DisconnectError, asyncssh.misc.ChannelOpenError, OSError) as ex:
-            # error or disconnected (retry)
-            cprint(f"Disconnected : {hostname}, {str(ex)}", color='red')
-            context.host_set_message(hostname, colored(str(ex), 'red'))
         except Exception as e:
-            # A general exception unhandled, throw
-            cprint(f"[{hostname:<{L}}] {e}", color='red')
+            cprint(f"[{hostname}] {type(e).__name__}: {e}", color='red')
             context.host_set_message(hostname, colored(f"{type(e).__name__}: {e}", 'red'))
-            cprint(traceback.format_exc())
-            raise
-
-        # retry upon timeout/disconnected, etc.
-        cprint(f"[{hostname:<{L}}] Disconnected, retrying in {poll_delay} sec...", color='yellow')
+        cprint(f"[{hostname}] Disconnected, retrying in {poll_delay} sec...", color='yellow')
         await asyncio.sleep(poll_delay)
 
 
-async def spawn_clients(hosts: List[str], exec_cmd: str, *,
+async def spawn_clients(hosts: List[str], exec_cmds: dict, *,
                         default_port: int, verify_host: bool = True,
                         verbose=False):
-    '''Create a set of async handlers, one per host.'''
+    """啟動多個 SSH 連線，每個 host 執行不同的 exec_cmd"""
 
-    def _parse_host_string(netloc: str) -> Tuple[str, Optional[int]]:
-        """Parse a connection string (netloc) in the form of `HOSTNAME[:PORT]`
-        and returns (HOSTNAME, PORT)."""
-        pr = urllib.parse.urlparse('ssh://{}/'.format(netloc))
-        assert pr.hostname is not None, netloc
-        return (pr.hostname, pr.port)
+    def _parse_host_string(netloc: str):
+        """解析 `USER@HOSTNAME[:PORT]` 格式，確保 `username`、`hostname` 和 `port`"""
+        match = re.match(r'(?:(?P<user>[\w-]+)@)?(?P<host>[^:]+)(?::(?P<port>\d+))?', netloc)
+        if not match or not match.group("host"):
+            raise ValueError(f"Invalid host format: {netloc}")
+
+        username = match.group("user") or "netdb"  # **如果沒有指定 user，預設使用 "netdb"**
+        hostname = match.group("host")
+        port = int(match.group("port")) if match.group("port") else default_port
+        return username, hostname, port
 
     try:
-        host_names: List[str]
-        host_ports: List[int]
-        host_names, host_ports = zip(*(_parse_host_string(host) for host in hosts))  # type: ignore
+        parsed_hosts = [_parse_host_string(host) for host in hosts]  # ✅ **確保不會有 None**
+        host_users, host_names, host_ports = zip(*parsed_hosts)
 
-        # initial response
+        # 初始化回應
         for hostname in host_names:
             context.host_set_message(hostname, "Loading ...")
 
-        name_length = max(len(hostname) for hostname in host_names)
-
-        # launch all clients parallel
+        # 啟動所有 SSH 連線，每台機器使用不同的 `exec_cmd`
         await asyncio.gather(*[
             run_client(
-                hostname, exec_cmd,
-                port=port or default_port,
+                hostname,
+                exec_cmds.get(hostname, "gpustat --color --force-color"),  # ✅ **允許每台機器不同 `exec_cmd`**
+                port=port,
+                username=username,
                 verify_host=verify_host,
-                verbose=verbose, name_length=name_length
+                verbose=verbose
             )
-            for (hostname, port) in zip(host_names, host_ports)
+            for username, hostname, port in parsed_hosts  # ✅ **這裡改成用 `parsed_hosts`，確保不會有 `NoneType`**
         ])
     except Exception as ex:
-        # TODO: throw the exception outside and let aiohttp abort startup
         traceback.print_exc()
-        cprint(colored("Error: An exception occured during the startup.", 'red'))
-
+        cprint(colored("Error: An exception occurred during the startup.", 'red'))
 
 ###############################################################################
 # webserver handlers.
@@ -275,10 +238,8 @@ def create_app(*,
                verify_host: bool = True,
                ssl_certfile: Optional[str] = None,
                ssl_keyfile: Optional[str] = None,
-               exec_cmd: Optional[str] = None,
+               exec_cmds: dict = None,  # ✅ 確保 exec_cmds 參數正確
                verbose=True):
-    if not exec_cmd:
-        exec_cmd = DEFAULT_GPUSTAT_COMMAND
 
     app = web.Application()
     app.router.add_get('/', handler)
@@ -289,20 +250,22 @@ def create_app(*,
 
     async def start_background_tasks(app):
         clients = spawn_clients(
-            hosts, exec_cmd, default_port=default_port,
+            hosts, exec_cmds,  # ✅ 傳遞 exec_cmds 到 `spawn_clients()`
+            default_port=default_port,
             verify_host=verify_host,
-            verbose=verbose)
-        # See #19 for why we need to this against aiohttp 3.5, 3.8, and 4.0
+            verbose=verbose
+        )
         loop = app.loop if hasattr(app, 'loop') else asyncio.get_event_loop()
         app['tasks'] = loop.create_task(clients)
         await asyncio.sleep(0.1)
+
     app.on_startup.append(start_background_tasks)
 
     async def shutdown_background_tasks(app):
         cprint(f"... Terminating the application", color='yellow')
         app['tasks'].cancel()
-    app.on_shutdown.append(shutdown_background_tasks)
 
+    app.on_shutdown.append(shutdown_background_tasks)
     # jinja2 setup
     import jinja2
     aiojinja2.setup(app,
@@ -318,49 +281,48 @@ def create_app(*,
 
         cprint(f"Using Secure HTTPS (SSL/TLS) server ...", color='green')
     else:
-        ssl_context = None   # type: ignore
+        ssl_context = None  # type: ignore
     return app, ssl_context
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('hosts', nargs='*',
-                        help='List of nodes. Syntax: HOSTNAME[:PORT]')
-    parser.add_argument('--verbose', action='store_true')
-    parser.add_argument('--port', type=int, default=48109,
-                        help="Port number the web application will listen to. (Default: 48109)")
-    parser.add_argument('--ssh-port', type=int, default=22,
-                        help="Default SSH port to establish connection through. (Default: 22)")
-    parser.add_argument('--no-verify-host', action='store_true',
-                        help="Skip SSH Host key verification. SSH host verification is turned on by default.")
-    parser.add_argument('--interval', type=float, default=5.0,
-                        help="Interval (in seconds) between two consecutive requests.")
-    parser.add_argument('--ssl-certfile', type=str, default=None,
-                        help="Path to the SSL certificate file (Optional, if want to run HTTPS server)")
-    parser.add_argument('--ssl-keyfile', type=str, default=None,
-                        help="Path to the SSL private key file (Optional, if want to run HTTPS server)")
-    parser.add_argument('--exec', type=str,
-                        default=DEFAULT_GPUSTAT_COMMAND,
-                        help="command-line to execute (e.g. gpustat --color --gpuname-width 25)")
+    parser = argparse.ArgumentParser(description="GPUStat Web Server")
+    parser.add_argument("hosts", nargs="*", help="List of nodes. Syntax: HOSTNAME[:PORT]")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--port", type=int, default=48109, help="Web application port")
+    parser.add_argument("--ssh-port", type=int, default=22, help="Default SSH port")
+    parser.add_argument("--no-verify-host", action="store_true", help="Skip SSH host key verification")
+    parser.add_argument("--interval", type=float, default=5.0, help="Polling interval")
+    parser.add_argument("--exec", action="append",
+                        help="Custom exec_cmd for specific hosts, format: 'IP:/path/to/gpustat'")
+
     args = parser.parse_args()
 
-    hosts = args.hosts or ['localhost']
-    cprint(f"Hosts : {hosts}", color='green')
-    cprint(f"Cmd   : {args.exec}", color='yellow')
+    hosts = args.hosts or ["localhost"]
+    cprint(f"Hosts : {hosts}", color="green")
+
+    # 解析 exec_cmds
+    exec_cmds = {}
+    if args.exec:
+        for entry in args.exec:
+            ip, cmd = entry.split(":", 1)
+            exec_cmds[ip] = cmd + " --color --force-color"
+
+    cprint(f"Exec Commands: {exec_cmds}", color="yellow")
 
     if args.interval > 0.1:
         context.interval = args.interval
 
-    app, ssl_context = create_app(
-        hosts=hosts, default_port=args.ssh_port,
+    app, _ = create_app(
+        hosts=hosts,
+        exec_cmds=exec_cmds,  # ✅ 確保 exec_cmds 傳遞到 `create_app()`
+        default_port=args.ssh_port,
         verify_host=not args.no_verify_host,
-        ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile,
-        exec_cmd=args.exec,
-        verbose=args.verbose)
+        verbose=args.verbose
+    )
 
-    web.run_app(app, host='0.0.0.0', port=args.port,
-                ssl_context=ssl_context)
+    web.run_app(app, host="0.0.0.0", port=args.port)
 
 if __name__ == '__main__':
     main()
