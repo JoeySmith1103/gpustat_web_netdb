@@ -60,11 +60,21 @@ Environment="PATH=/home/netdb/.local/bin:/usr/local/bin:/usr/bin:/bin"
 [Install]
 WantedBy=multi-user.target
 ```
+**RELOAD**
 ```
 sudo systemctl daemon-reload
 ```
+**START**
+```
+sudo systemctl start gpustat-web
+```
+**RESTART**
 ```
 sudo systemctl restart gpustat-web
+```
+**CHECK STATUS**
+```
+sudo systemctl status gpustat-web
 ```
 You might get "Host key is not trusted for `<host>`" errors. You'll have to accept and trust SSH keys of the host for the first time (it's stored in `~/.ssh/known_hosts`);
 try `ssh <host>` in the command line, or `ssh -oStrictHostKeyChecking=accept-new <host>` to automatically accept the host key. You can also use an option `gpustat-web --no-verify-host` to bypass SSH Host key validation (although not recommended).
